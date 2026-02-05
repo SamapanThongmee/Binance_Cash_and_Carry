@@ -23,8 +23,8 @@ warnings.filterwarnings('ignore')
 # CONFIGURATION
 # =============================================================================
 # Telegram API (use environment variables for security)
-API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_TOKEN = "8581449368:AAGizloFpLC7-DSKQsgqGs7kIiE3a44Czok" # os.getenv("TELEGRAM_API_TOKEN")
+CHAT_ID = "7311904934" #os.getenv("TELEGRAM_CHAT_ID")
 
 # Interest rate and dividend yield
 RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.017"))
