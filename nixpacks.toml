@@ -1,8 +1,17 @@
 [phases.setup]
-nixPkgs = ["python311", "gcc"]
+nixPkgs = ["python311", "python311Packages.pip", "gcc"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["python3 -m pip install -r requirements.txt"]
 
 [start]
-cmd = "python main.py"
+cmd = "python3 main.py"
+```
+
+**Or alternatively, delete `nixpacks.toml` entirely** and let Railway auto-detect Python. Just keep these files:
+
+1. **requirements.txt** (same as before)
+2. **runtime.txt** (same as before) 
+3. **Procfile** - change to:
+```
+web: python main.py
