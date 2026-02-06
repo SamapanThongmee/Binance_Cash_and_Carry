@@ -1,7 +1,7 @@
 """
-SET50 Futures Calendar Spread Analysis
-Analyzes calendar spreads for SET50 futures and sends reports to Telegram
-Supports both 5-minute (main chart) and 1-minute (intraday chart) timeframes
+Binance Cash and Carry Arbitrage Analysis
+Analyzes BTC spot vs futures basis and APY across multiple contracts
+Sends reports to Telegram
 """
 
 import os
@@ -9,9 +9,10 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import requests
-from io import BytesIO
 import warnings
+from typing import Dict, Optional
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -23,16 +24,12 @@ warnings.filterwarnings('ignore')
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-# Telegram API (use environment variables for security)
-API_TOKEN = os.getenv("TELEGRAM_API_TOKEN", "8512267917:AAGjHTfr5bzo8K5W0W5zsXZB36Xti5QGHS8")
+API_TOKEN = os.getenv("TELEGRAM_API_TOKEN", "7594281395:AAHZq1bz9Ym5-9bjjtMs_kcwS5CzUjznMEE")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7311904934")
 
-# Interest rate and dividend yield
-RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.017"))
-DIVIDEND_YIELD = float(os.getenv("DIVIDEND_YIELD", "0.0373"))
-
-# Timezone
-TZ = 'Asia/Bangkok'
+# Timeframe and lookback (same as original)
+TIMEFRAME = '1'
+LOOKBACK = 762
 
 # Output directory
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./output")
@@ -78,27 +75,13 @@ def send_photo(image_path: str) -> bool:
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
-def make_spread_name(near_symbol: str, far_symbol: str) -> str:
-    """
-    Build a compact spread name like 'S50G26H26'
-    from symbols like 'S50G2026' and 'S50H2026'.
-    Format: <product><near_month><near_YY><far_month><far_YY>
-    """
-    product = near_symbol[:3]
-    near_month = near_symbol[3]
-    near_yy = near_symbol[-2:]
-    far_month = far_symbol[3]
-    far_yy = far_symbol[-2:]
-    return f"{product}{near_month}{near_yy}{far_month}{far_yy}"
-
-
 def get_trading_days(df: pd.DataFrame, n_days: int = 5) -> pd.DataFrame | None:
     """
     Filter dataframe to last N trading days.
     Returns None if fewer than n_days trading days are available.
     """
     df = df.copy()
-    df['_date'] = pd.to_datetime(df['Timestamp']).dt.date
+    df['_date'] = pd.to_datetime(df['timestamp']).dt.date
     unique_dates = sorted(df['_date'].unique())
 
     if len(unique_dates) < n_days:
@@ -113,394 +96,355 @@ def get_trading_days(df: pd.DataFrame, n_days: int = 5) -> pd.DataFrame | None:
 # =============================================================================
 # DATA LOADING
 # =============================================================================
-def load_data(symbol: str, timeframe: str) -> pd.DataFrame:
-    """Load price data for a given symbol and timeframe"""
+def load_asset_price(symbol: str, lookback: int, timeframe: str, extra=None) -> pd.DataFrame:
+    """Load price data for a given symbol"""
     from price_loaders.tradingview import load_asset_price
-    return load_asset_price(symbol, 100000, timeframe, None)
-
-
-def load_set50(timeframe: str) -> pd.DataFrame:
-    """Load SET50 index data"""
-    df = load_data('SET50', timeframe)
-    return df[['time', 'close']].rename(columns={'time': 'Timestamp', 'close': 'SET50_Close'})
-
-
-def load_futures(symbol: str, prefix: str, timeframe: str) -> pd.DataFrame:
-    """Load futures contract data"""
-    df = load_data(f'TFEX:{symbol}', timeframe)
-    return df[['time', 'open', 'high', 'low', 'close']].rename(columns={
-        'time': 'Timestamp',
-        'open': f'{prefix}_Open',
-        'high': f'{prefix}_High',
-        'low': f'{prefix}_Low',
-        'close': f'{prefix}_Close'
-    })
+    return load_asset_price(symbol, lookback, timeframe, extra)
 
 
 # =============================================================================
-# SPREAD ANALYSIS
+# ANALYZER
 # =============================================================================
-class CalendarSpreadAnalyzer:
-    """Analyzes calendar spreads between two futures contracts"""
+class BitcoinFuturesAnalyzer:
+    """Analyzes Bitcoin cash-and-carry arbitrage opportunities"""
 
-    def __init__(self, near_symbol: str, far_symbol: str,
-                 near_expiry: str, far_expiry: str,
-                 near_label: str, far_label: str):
-        self.near_symbol = near_symbol
-        self.far_symbol = far_symbol
-        self.near_expiry = near_expiry
-        self.far_expiry = far_expiry
-        self.near_label = near_label
-        self.far_label = far_label
-        self.spread_name = make_spread_name(near_symbol, far_symbol)
+    # Color scheme
+    COLORS = {
+        'spot': '#A9A9A9',
+        'futures': '#FF69B4',
+        'volume': '#FFC0CB',
+        'basis': '#FF69B4',
+        'apy': '#FF69B4',
+    }
+
+    def __init__(self, spot_symbol: str, futures_symbol: str,
+                 expiry_date: str, label: str,
+                 lookback: int = LOOKBACK):
+        self.spot_symbol = spot_symbol
+        self.futures_symbol = futures_symbol
+        self.expiry_date = dt.datetime.fromisoformat(expiry_date)
+        self.label = label
+        self.lookback = lookback
 
         # Will be populated by load_and_calculate()
-        self.df_5min = None
-        self.df_1min = None
-        self.near_prefix = None
-        self.far_prefix = None
-        self.spread_prefix = None
+        self.df = None
 
-    def _calculate_spread_metrics(self, df: pd.DataFrame,
-                                  near_prefix: str, far_prefix: str,
-                                  spread_prefix: str) -> pd.DataFrame:
-        """Calculate all spread metrics for a given dataframe"""
+    def _calculate_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate futures basis, days to expiry, and APY"""
+        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
 
-        # Spread OHLC
-        for col in ['Open', 'High', 'Low', 'Close']:
-            df[f'{spread_prefix}_{col}'] = df[f'{far_prefix}_{col}'] - df[f'{near_prefix}_{col}']
+        # Futures basis (percentage)
+        df['futures_basis_pct'] = ((df['futures_price'] / df['spot_price']) - 1) * 100
 
-        # All possible spread combinations
-        df[f'{spread_prefix}_Diff_High_High'] = df[f'{far_prefix}_High'] - df[f'{near_prefix}_High']
-        df[f'{spread_prefix}_Diff_High_Low'] = df[f'{far_prefix}_Low'] - df[f'{near_prefix}_High']
-        df[f'{spread_prefix}_Diff_Low_High'] = df[f'{far_prefix}_High'] - df[f'{near_prefix}_Low']
-        df[f'{spread_prefix}_Diff_Low_Low'] = df[f'{far_prefix}_Low'] - df[f'{near_prefix}_Low']
+        # Days to expiry
+        df['days_to_expiry'] = (self.expiry_date - df['timestamp']).dt.days
 
-        # Maximum difference
-        df[f'{spread_prefix}_Max_Diff'] = df[[
-            f'{spread_prefix}_Diff_High_High',
-            f'{spread_prefix}_Diff_High_Low',
-            f'{spread_prefix}_Diff_Low_High',
-            f'{spread_prefix}_Diff_Low_Low'
-        ]].max(axis=1)
-
-        # Time to expiry
-        near_expiry_dt = pd.to_datetime(self.near_expiry).tz_localize(TZ)
-        far_expiry_dt = pd.to_datetime(self.far_expiry).tz_localize(TZ)
-
-        df[f'{near_prefix}_Time_to_expiry'] = (
-            (near_expiry_dt - df['Timestamp']).dt.total_seconds() / (24 * 3600)
-        ).astype(int)
-
-        df[f'{far_prefix}_Time_to_expiry'] = (
-            (far_expiry_dt - df['Timestamp']).dt.total_seconds() / (24 * 3600)
-        ).astype(int)
-
-        # Theoretical pricing (Cost-of-Carry Model)
-        df[f'{near_prefix}_Expected_Futures_Price'] = (
-            df['SET50_Close'] *
-            np.exp((RISK_FREE_RATE - DIVIDEND_YIELD) * (df[f'{near_prefix}_Time_to_expiry'] / 365))
-        )
-
-        df[f'{far_prefix}_Expected_Futures_Price'] = (
-            df['SET50_Close'] *
-            np.exp((RISK_FREE_RATE - DIVIDEND_YIELD) * (df[f'{far_prefix}_Time_to_expiry'] / 365))
-        )
-
-        # Basis
-        df[f'{near_prefix}_Basis'] = df[f'{near_prefix}_Expected_Futures_Price'] - df['SET50_Close']
-        df[f'{far_prefix}_Basis'] = df[f'{far_prefix}_Expected_Futures_Price'] - df['SET50_Close']
-
-        # Theoretical and actual spread basis
-        df[f'{spread_prefix}_Theoretical_Basis'] = df[f'{far_prefix}_Basis'] - df[f'{near_prefix}_Basis']
-        df[f'{spread_prefix}_Actual_Basis'] = df[f'{spread_prefix}_Close']
-        df[f'{spread_prefix}_Mispricing'] = (
-            df[f'{spread_prefix}_Actual_Basis'] - df[f'{spread_prefix}_Theoretical_Basis']
+        # APY (avoid division by zero)
+        mask = df['days_to_expiry'] > 0
+        df['apy'] = np.nan
+        df.loc[mask, 'apy'] = (
+            df.loc[mask, 'futures_basis_pct'] * 365 / df.loc[mask, 'days_to_expiry']
         )
 
         return df
 
-    def load_and_calculate(self) -> None:
-        """Load data for both timeframes and calculate spread metrics"""
-        near_prefix = self.near_symbol
-        far_prefix = self.far_symbol
-        spread_prefix = self.spread_name
+    def load_and_calculate(self) -> pd.DataFrame:
+        """Load spot and futures data, merge and calculate metrics"""
+        print(f"  Loading {TIMEFRAME}-min data (lookback={self.lookback})...")
 
-        self.near_prefix = near_prefix
-        self.far_prefix = far_prefix
-        self.spread_prefix = spread_prefix
+        spot = load_asset_price(self.spot_symbol, self.lookback, TIMEFRAME, None)[['time', 'close']]
+        futures = load_asset_price(self.futures_symbol, self.lookback, TIMEFRAME, None)[['time', 'close', 'volume']]
 
-        for timeframe, attr_name in [('5', 'df_5min'), ('1', 'df_1min')]:
-            print(f"  Loading {timeframe}-min data...")
-            try:
-                set50 = load_set50(timeframe)
-                near = load_futures(self.near_symbol, near_prefix, timeframe)
-                far = load_futures(self.far_symbol, far_prefix, timeframe)
+        df = spot.merge(futures, on='time', how='inner')
+        df = df.rename(columns={
+            'time': 'timestamp',
+            'close_x': 'spot_price',
+            'close_y': 'futures_price',
+            'volume': 'futures_volume'
+        })
 
-                df = near.merge(far, on='Timestamp', how='left')
-                df = set50.merge(df, on='Timestamp', how='inner')
-                df = self._calculate_spread_metrics(df, near_prefix, far_prefix, spread_prefix)
+        df = self._calculate_metrics(df)
+        self.df = df.dropna(subset=['spot_price', 'futures_price']).reset_index(drop=True)
 
-                setattr(self, attr_name, df)
-                print(f"  {timeframe}-min data loaded: {len(df)} rows")
-            except Exception as e:
-                print(f"  Warning: Failed to load {timeframe}-min data: {e}")
-                setattr(self, attr_name, None)
+        print(f"  Data loaded: {len(self.df)} rows")
+        return self.df
 
-    def find_extremes(self, df: pd.DataFrame = None) -> dict:
-        """Find max and min spread values"""
-        if df is None:
-            df = self.df_5min
-        spread_prefix = self.spread_prefix
+    def generate_summary_stats(self) -> Dict[str, float]:
+        """Generate summary statistics"""
+        if self.df is None or len(self.df) == 0:
+            return {}
 
-        # Find max
-        max_idx = df[f'{spread_prefix}_Max_Diff'].idxmax()
-        max_row = df.loc[max_idx]
-        max_value = np.round(max_row[f'{spread_prefix}_Max_Diff'], 3)
-        max_timestamp = max_row['Timestamp']
-
-        diff_cols = ['Diff_High_High', 'Diff_High_Low', 'Diff_Low_High', 'Diff_Low_Low']
-        type_labels = ['H-H', 'H-L', 'L-H', 'L-L']
-        max_type = type_labels[0]
-        for col, label in zip(diff_cols, type_labels):
-            if max_row[f'{spread_prefix}_{col}'] == max_row[f'{spread_prefix}_Max_Diff']:
-                max_type = label
-                break
-
-        # Find min
-        min_idx = df[f'{spread_prefix}_Max_Diff'].idxmin()
-        min_row = df.loc[min_idx]
-        min_value = np.round(min_row[f'{spread_prefix}_Max_Diff'], 3)
-        min_timestamp = min_row['Timestamp']
-
-        min_type = type_labels[0]
-        for col, label in zip(diff_cols, type_labels):
-            if min_row[f'{spread_prefix}_{col}'] == min_row[f'{spread_prefix}_Max_Diff']:
-                min_type = label
-                break
+        clean_apy = self.df['apy'].dropna()
+        clean_apy = clean_apy[np.abs(clean_apy) < 100]
 
         return {
-            'max_value': max_value,
-            'max_timestamp': max_timestamp,
-            'max_type': max_type,
-            'min_value': min_value,
-            'min_timestamp': min_timestamp,
-            'min_type': min_type
+            'avg_basis_pct': self.df['futures_basis_pct'].mean(),
+            'current_basis_pct': self.df['futures_basis_pct'].iloc[-1],
+            'avg_apy': clean_apy.mean() if len(clean_apy) > 0 else np.nan,
+            'current_apy': clean_apy.iloc[-1] if len(clean_apy) > 0 else np.nan,
+            'days_remaining': int(self.df['days_to_expiry'].iloc[-1]),
         }
 
+    # =========================================================================
+    # CHART DRAWING
+    # =========================================================================
     def _draw_chart(self, df: pd.DataFrame, title: str, img_path: str,
-                    date_fmt: str = '%Y-%m-%d', n_labels: int = 10,
-                    linewidth: float = 1.5, figsize: tuple = (16, 10),
-                    show_day_boundaries: bool = False) -> str:
-        """Shared chart drawing logic for both 5-min and 1-min charts"""
+                    show_day_boundaries: bool = False,
+                    figsize: tuple = (14, 12)) -> str:
+        """Shared chart drawing: 3 subplots (price+vol, basis, APY)"""
         df = df.copy()
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        df = df.sort_values('Timestamp').reset_index(drop=True)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp').reset_index(drop=True)
 
-        fig, (ax1, ax3) = plt.subplots(2, 1, figsize=figsize)
+        fig, (ax_price, ax_basis, ax_apy) = plt.subplots(
+            3, 1, figsize=figsize, sharex=True
+        )
         fig.suptitle(title, fontsize=16, fontweight='bold')
 
-        x_index = np.arange(len(df))
+        # --- Subplot 1: Spot vs Futures Prices + Volume ---
+        ax_price.plot(df['timestamp'], df['spot_price'],
+                      label='Spot Price', color=self.COLORS['spot'], linewidth=2)
+        ax_price.plot(df['timestamp'], df['futures_price'],
+                      label='Futures Price', color=self.COLORS['futures'], linewidth=2)
 
-        # --- Subplot 1: Prices + Max Diff ---
-        ax1.plot(x_index, df['SET50_Close'], label='SET50 Index',
-                 color='#2E86AB', linewidth=linewidth)
-        ax1.plot(x_index, df[f'{self.near_prefix}_Close'],
-                 label=f'{self.near_prefix} ({self.near_label})',
-                 color='#A23B72', linewidth=linewidth)
-        ax1.plot(x_index, df[f'{self.far_prefix}_Close'],
-                 label=f'{self.far_prefix} ({self.far_label})',
-                 color='#F18F01', linewidth=linewidth)
+        ax_vol = ax_price.twinx()
+        ax_vol.plot(df['timestamp'], df['futures_volume'],
+                    label='Futures Volume', color=self.COLORS['volume'],
+                    linewidth=0.8, linestyle='--', alpha=0.7)
 
-        ax1.set_ylabel('Price', fontsize=12, fontweight='bold')
-        ax1.legend(loc='upper left', fontsize=10)
-        ax1.grid(True, alpha=0.3, linestyle='--')
-        ax1.set_title('Futures Prices & Maximum Spread Difference', fontsize=13, pad=10)
+        ax_price.set_ylabel('Price (USDT)', fontsize=11, fontweight='bold')
+        ax_vol.set_ylabel('Volume', fontsize=11, fontweight='bold')
+        ax_price.set_title('Bitcoin: Spot vs Futures Prices', fontsize=14, fontweight='bold', pad=20)
+        ax_price.legend(loc='upper left', fontsize=10)
+        ax_vol.legend(loc='upper right', fontsize=10)
+        ax_price.grid(True, linestyle='--', alpha=0.3)
 
-        ax2 = ax1.twinx()
-        ax2.plot(x_index, df[f'{self.spread_prefix}_Max_Diff'], label='Max Diff',
-                 color='#C73E1D', linewidth=linewidth, linestyle='--', alpha=0.7)
-        ax2.set_ylabel('Max Difference', fontsize=12, fontweight='bold', color='#C73E1D')
-        ax2.tick_params(axis='y', labelcolor='#C73E1D')
-        ax2.legend(loc='upper right', fontsize=10)
+        # --- Subplot 2: Futures Basis % ---
+        ax_basis.plot(df['timestamp'], df['futures_basis_pct'],
+                      color=self.COLORS['basis'], linewidth=1.5)
+        ax_basis.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.8)
+        ax_basis.set_ylabel('Basis (%)', fontsize=11, fontweight='bold')
+        ax_basis.set_title('Futures Basis (Premium/Discount)', fontsize=14, fontweight='bold', pad=20)
+        ax_basis.grid(True, linestyle='--', alpha=0.3)
+        self._format_basis_yticks(ax_basis)
 
-        # --- Subplot 2: Basis Analysis ---
-        ax3.plot(x_index, df[f'{self.spread_prefix}_Theoretical_Basis'],
-                 label='Theoretical Basis', color='#06A77D', linewidth=linewidth)
-        ax3.plot(x_index, df[f'{self.spread_prefix}_Actual_Basis'],
-                 label='Actual Basis', color='#D62246', linewidth=linewidth)
-        ax3.plot(x_index, df[f'{self.spread_prefix}_Mispricing'],
-                 label='Mispricing', color='#F77F00', linewidth=linewidth, linestyle='--')
+        # --- Subplot 3: APY ---
+        clean = df[np.abs(df['apy']) < 100].copy()
+        ax_apy.plot(clean['timestamp'], clean['apy'],
+                    color=self.COLORS['apy'], linewidth=1.5)
+        ax_apy.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=0.8)
+        ax_apy.set_ylabel('APY (%)', fontsize=11, fontweight='bold')
+        ax_apy.set_xlabel('Date', fontsize=11, fontweight='bold')
+        ax_apy.set_title('Annualized Yield from Futures Basis', fontsize=14, fontweight='bold', pad=20)
+        ax_apy.grid(True, linestyle='--', alpha=0.3)
+        self._format_apy_yticks(ax_apy)
 
-        ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.5)
-        ax3.set_xlabel('Trading Period', fontsize=12, fontweight='bold')
-        ax3.set_ylabel('Basis (points)', fontsize=12, fontweight='bold')
-        ax3.legend(loc='best', fontsize=10)
-        ax3.grid(True, alpha=0.3, linestyle='--')
-        ax3.set_title('Calendar Spread Basis Analysis', fontsize=13, pad=10)
-
-        # Annotations for latest values
-        latest_idx = len(df) - 1
-        latest_theoretical = df[f'{self.spread_prefix}_Theoretical_Basis'].iloc[-1]
-        latest_actual = df[f'{self.spread_prefix}_Actual_Basis'].iloc[-1]
-        latest_mispricing = df[f'{self.spread_prefix}_Mispricing'].iloc[-1]
-
-        ax3.annotate(f'Theoretical\n{latest_theoretical:.2f}',
-                     xy=(latest_idx, latest_theoretical), xytext=(10, 10),
-                     textcoords='offset points',
-                     bbox=dict(boxstyle='round,pad=0.5', facecolor='#06A77D',
-                               alpha=0.7, edgecolor='none'),
-                     color='white', fontsize=9, fontweight='bold', ha='left')
-        ax3.annotate(f'Actual\n{latest_actual:.2f}',
-                     xy=(latest_idx, latest_actual), xytext=(10, -10),
-                     textcoords='offset points',
-                     bbox=dict(boxstyle='round,pad=0.5', facecolor='#D62246',
-                               alpha=0.7, edgecolor='none'),
-                     color='white', fontsize=9, fontweight='bold', ha='left')
-        ax3.annotate(f'Mispricing\n{latest_mispricing:.2f}',
-                     xy=(latest_idx, latest_mispricing), xytext=(10, 0),
-                     textcoords='offset points',
-                     bbox=dict(boxstyle='round,pad=0.5', facecolor='#F77F00',
-                               alpha=0.7, edgecolor='none'),
-                     color='white', fontsize=9, fontweight='bold', ha='left')
-
-        # Day boundary lines (for intraday charts)
+        # --- Day boundary lines (for intraday chart) ---
         if show_day_boundaries:
-            dates = df['Timestamp'].dt.date
+            dates = df['timestamp'].dt.date
             for i in range(1, len(df)):
                 if dates.iloc[i] != dates.iloc[i - 1]:
-                    for ax in [ax1, ax3]:
-                        ax.axvline(x=i, color='gray', linestyle='-',
-                                   linewidth=0.8, alpha=0.5)
+                    for ax in [ax_price, ax_basis, ax_apy]:
+                        ax.axvline(x=df['timestamp'].iloc[i], color='gray',
+                                   linestyle='-', linewidth=0.8, alpha=0.5)
 
-        # X-axis labels
-        n_labels = min(n_labels, len(df))
-        indices = np.linspace(0, len(df) - 1, n_labels, dtype=int)
-        date_labels = [df['Timestamp'].iloc[i].strftime(date_fmt) for i in indices]
+        # --- X-axis formatting ---
+        self._format_x_axis([ax_price, ax_basis, ax_apy])
 
-        for ax in [ax1, ax3]:
-            ax.set_xlim(0, len(df) - 1)
-            ax.set_xticks(indices)
-            ax.set_xticklabels(date_labels, rotation=45, ha='right', fontsize=8)
-
-        plt.tight_layout()
-        fig.savefig(img_path, dpi=300, bbox_inches='tight')
+        plt.tight_layout(pad=3.0)
+        plt.subplots_adjust(top=0.95, bottom=0.15)
+        fig.savefig(img_path, dpi=300, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
         plt.close(fig)
 
         return img_path
 
-    def create_chart_5min(self, filter_days: int = 40) -> str | None:
-        """Create the 5-minute timeframe chart"""
-        if self.df_5min is None or len(self.df_5min) == 0:
-            print(f"  [5-min] Skipped: no data available for {self.spread_name}")
+    @staticmethod
+    def _format_basis_yticks(ax: plt.Axes) -> None:
+        """Smart y-axis tick spacing for basis subplot"""
+        y_min, y_max = ax.get_ylim()
+        y_range = y_max - y_min
+
+        if y_range < 0.2:
+            step = 0.02
+        elif y_range < 0.5:
+            step = 0.05
+        elif y_range < 1.0:
+            step = 0.1
+        elif y_range < 2.0:
+            step = 0.2
+        else:
+            step = 0.5
+
+        ticks = np.arange(
+            np.floor(y_min / step) * step,
+            np.ceil(y_max / step) * step + step,
+            step
+        )
+        if len(ticks) > 10:
+            step *= 2
+            ticks = np.arange(
+                np.floor(y_min / step) * step,
+                np.ceil(y_max / step) * step + step,
+                step
+            )
+        ax.set_yticks(ticks)
+        ax.set_ylim(y_min, y_max)
+        fmt = f'{{x:.1f}}' if step >= 0.1 else f'{{x:.3f}}'
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: fmt.format(x=x)))
+
+    @staticmethod
+    def _format_apy_yticks(ax: plt.Axes) -> None:
+        """Smart y-axis tick spacing for APY subplot"""
+        y_min, y_max = ax.get_ylim()
+        y_range = y_max - y_min
+
+        if y_range < 2:
+            step = 0.2
+        elif y_range < 5:
+            step = 0.5
+        elif y_range < 10:
+            step = 1.0
+        else:
+            step = 2.0
+
+        ticks = np.arange(
+            np.floor(y_min / step) * step,
+            np.ceil(y_max / step) * step + step,
+            step
+        )
+        ax.set_yticks(ticks)
+        ax.set_ylim(y_min, y_max)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1f}'))
+
+    @staticmethod
+    def _format_x_axis(axes: list) -> None:
+        """Format x-axis for all subplots (same as original)"""
+        for ax in axes:
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
+            ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=30))
+
+            for label in ax.get_xticklabels():
+                label.set_rotation(90)
+                label.set_horizontalalignment('center')
+                label.set_fontsize(8)
+
+            ax.xaxis.grid(True, which='major', alpha=0.5, linewidth=0.8)
+            ax.xaxis.grid(True, which='minor', alpha=0.2, linewidth=0.4)
+
+    # =========================================================================
+    # PUBLIC CHART METHODS
+    # =========================================================================
+    def create_chart(self) -> str | None:
+        """Create the main chart (all data)"""
+        if self.df is None or len(self.df) == 0:
+            print(f"  [Chart] Skipped: no data for {self.label}")
             return None
 
-        df = self.df_5min.copy()
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        df = df.sort_values('Timestamp').reset_index(drop=True)
+        title = f'Bitcoin: Spot vs Futures Prices ({self.label})'
+        img_path = os.path.join(OUTPUT_DIR, f'BTC_{self.label}_chart.png')
 
-        # Filter to last N calendar days
-        date_range_days = (df['Timestamp'].max() - df['Timestamp'].min()).days
-        if date_range_days > filter_days:
-            cutoff_date = df['Timestamp'].max() - pd.Timedelta(days=filter_days)
-            df = df[df['Timestamp'] >= cutoff_date].reset_index(drop=True)
+        return self._draw_chart(self.df, title, img_path,
+                                show_day_boundaries=False, figsize=(14, 12))
 
-        title = f'SET50 Calendar Spread Analysis ({self.spread_name}, 5-min)'
-        img_path = os.path.join(OUTPUT_DIR, f'{self.spread_name}_5min_chart.png')
-
-        return self._draw_chart(
-            df=df, title=title, img_path=img_path,
-            date_fmt='%Y-%m-%d', n_labels=10, linewidth=1.5,
-            figsize=(16, 10), show_day_boundaries=False
-        )
-
-    def create_chart_1min(self, n_trading_days: int = 5) -> str | None:
+    def create_intraday_chart(self, n_trading_days: int = 5) -> str | None:
         """
-        Create the 1-minute intraday chart for the last N trading days.
+        Create intraday chart for the last N trading days.
         Returns None if fewer than n_trading_days are available.
         """
-        if self.df_1min is None or len(self.df_1min) == 0:
-            print(f"  [1-min] Skipped: no data available for {self.spread_name}")
+        if self.df is None or len(self.df) == 0:
+            print(f"  [Intraday] Skipped: no data for {self.label}")
             return None
 
-        df_filtered = get_trading_days(self.df_1min, n_trading_days)
+        df_filtered = get_trading_days(self.df, n_trading_days)
         if df_filtered is None:
-            print(f"  [1-min] Skipped: fewer than {n_trading_days} trading days "
-                  f"available for {self.spread_name}")
+            print(f"  [Intraday] Skipped: fewer than {n_trading_days} trading days "
+                  f"for {self.label}")
             return None
 
-        df_filtered = df_filtered.sort_values('Timestamp').reset_index(drop=True)
+        df_filtered = df_filtered.sort_values('timestamp').reset_index(drop=True)
 
-        title = (f'SET50 Calendar Spread – Last {n_trading_days} Trading Days '
-                 f'({self.spread_name}, 1-min)')
-        img_path = os.path.join(OUTPUT_DIR, f'{self.spread_name}_1min_chart.png')
+        title = (f'Bitcoin: Spot vs Futures – Last {n_trading_days} Days '
+                 f'({self.label}, 1-min)')
+        img_path = os.path.join(OUTPUT_DIR, f'BTC_{self.label}_intraday_chart.png')
 
-        return self._draw_chart(
-            df=df_filtered, title=title, img_path=img_path,
-            date_fmt='%m-%d %H:%M', n_labels=15, linewidth=1.0,
-            figsize=(18, 10), show_day_boundaries=True
-        )
+        return self._draw_chart(df_filtered, title, img_path,
+                                show_day_boundaries=True, figsize=(18, 12))
 
+    # =========================================================================
+    # RUN ANALYSIS
+    # =========================================================================
     def run_analysis(self, send_telegram: bool = True) -> dict:
         """Run complete analysis and optionally send to Telegram"""
         print(f"\n{'='*60}")
-        print(f"Analyzing {self.spread_name}")
+        print(f"Analyzing {self.label} ({self.futures_symbol})")
+        print(f"Expiry: {self.expiry_date.strftime('%Y-%m-%d %H:%M')}")
         print(f"{'='*60}")
 
-        # Load and calculate both timeframes
+        # Load data
         self.load_and_calculate()
 
-        # Find extremes (from 5-min data)
-        extremes = None
-        if self.df_5min is not None:
-            extremes = self.find_extremes(self.df_5min)
-            print(f"Max: {extremes['max_value']} at {extremes['max_timestamp']} "
-                  f"(Type: {extremes['max_type']})")
-            print(f"Min: {extremes['min_value']} at {extremes['min_timestamp']} "
-                  f"(Type: {extremes['min_type']})")
+        # Summary stats
+        stats = self.generate_summary_stats()
+        if stats:
+            print(f"  Current Basis: {stats['current_basis_pct']:.3f}%")
+            print(f"  Average Basis: {stats['avg_basis_pct']:.3f}%")
+            print(f"  Current APY:   {stats['current_apy']:.1f}%")
+            print(f"  Average APY:   {stats['avg_apy']:.1f}%")
+            print(f"  Days to Expiry: {stats['days_remaining']}")
 
         # Create charts
-        chart_5min_path = self.create_chart_5min()
-        if chart_5min_path:
-            print(f"5-min chart saved: {chart_5min_path}")
+        chart_path = self.create_chart()
+        if chart_path:
+            print(f"  Chart saved: {chart_path}")
 
-        chart_1min_path = self.create_chart_1min(n_trading_days=5)
-        if chart_1min_path:
-            print(f"1-min chart saved: {chart_1min_path}")
+        intraday_path = self.create_intraday_chart(n_trading_days=5)
+        if intraday_path:
+            print(f"  Intraday chart saved: {intraday_path}")
 
         # Send to Telegram
-        if send_telegram and extremes:
-            msg = (f"\n{self.spread_name} Spread Analysis\n"
-                   f"Max: {extremes['max_value']} at {extremes['max_timestamp']} "
-                   f"(Type: {extremes['max_type']})\n"
-                   f"Min: {extremes['min_value']} at {extremes['min_timestamp']} "
-                   f"(Type: {extremes['min_type']})")
+        if send_telegram and stats:
+            current_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg = (
+                f"🚀 BTC Cash & Carry – {self.label}\n"
+                f"📊 {current_time}\n\n"
+                f"• Current Basis: {stats['current_basis_pct']:.3f}%\n"
+                f"• Average Basis: {stats['avg_basis_pct']:.3f}%\n"
+                f"• Current APY: {stats['current_apy']:.1f}%\n"
+                f"• Average APY: {stats['avg_apy']:.1f}%\n"
+                f"• Days to Expiry: {stats['days_remaining']}"
+            )
             send_message(msg)
-            if chart_5min_path:
-                send_photo(chart_5min_path)
-            if chart_1min_path:
-                send_photo(chart_1min_path)
+            if chart_path:
+                send_photo(chart_path)
+            if intraday_path:
+                send_photo(intraday_path)
 
         return {
-            'spread_name': self.spread_name,
-            'extremes': extremes,
-            'chart_5min_path': chart_5min_path,
-            'chart_1min_path': chart_1min_path
+            'label': self.label,
+            'stats': stats,
+            'chart_path': chart_path,
+            'intraday_chart_path': intraday_path,
         }
 
 
 # =============================================================================
-# SPREAD CONFIGURATIONS
+# CONTRACT CONFIGURATIONS
 # =============================================================================
-SPREAD_CONFIGS = [
+CONTRACT_CONFIGS = [
     {
-        'near_symbol': 'S50H2026',
-        'far_symbol': 'S50M2026',
-        'near_expiry': '2026-03-30',
-        'far_expiry': '2026-06-29',
-        'near_label': 'Mar',
-        'far_label': 'Jun'
-    }
+        'spot_symbol': 'BINANCE:BTCUSDT',
+        'futures_symbol': 'BINANCE:BTCUSDH2026',
+        'expiry_date': '2026-03-27T08:00:00',
+        'label': 'H2026_Mar',
+    },
+    {
+        'spot_symbol': 'BINANCE:BTCUSDT',
+        'futures_symbol': 'BINANCE:BTCUSDM2026',
+        'expiry_date': '2026-06-26T08:00:00',
+        'label': 'M2026_Jun',
+    },
 ]
 
 
@@ -510,26 +454,24 @@ SPREAD_CONFIGS = [
 def main():
     """Main execution function"""
     print("=" * 60)
-    print("SET50 Futures Calendar Spread Analysis")
+    print("Binance BTC Cash & Carry Arbitrage Analysis")
     print(f"Started at: {dt.datetime.now()}")
     print("=" * 60)
 
     results = []
 
-    for config in SPREAD_CONFIGS:
+    for config in CONTRACT_CONFIGS:
         try:
-            analyzer = CalendarSpreadAnalyzer(
-                near_symbol=config['near_symbol'],
-                far_symbol=config['far_symbol'],
-                near_expiry=config['near_expiry'],
-                far_expiry=config['far_expiry'],
-                near_label=config['near_label'],
-                far_label=config['far_label']
+            analyzer = BitcoinFuturesAnalyzer(
+                spot_symbol=config['spot_symbol'],
+                futures_symbol=config['futures_symbol'],
+                expiry_date=config['expiry_date'],
+                label=config['label'],
             )
             result = analyzer.run_analysis(send_telegram=True)
             results.append(result)
         except Exception as e:
-            print(f"Error analyzing {config['near_symbol']}-{config['far_symbol']}: {e}")
+            print(f"Error analyzing {config['label']}: {e}")
             import traceback
             traceback.print_exc()
 
